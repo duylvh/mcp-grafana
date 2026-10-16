@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -83,7 +84,8 @@ func TestGrafanaURLOverrideIsolatesConfiguredCredentials(t *testing.T) {
 	var cfg GrafanaConfig
 	h := GrafanaURLOverrideMiddleware(true, []string{server.URL}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := ExtractGrafanaInfoFromHeaders(WithGrafanaConfig(r.Context(), GrafanaConfig{
-			TLSConfig: &TLSConfig{CertFile: "client.crt", KeyFile: "client.key", SkipVerify: true},
+			TLSConfig:  &TLSConfig{CertFile: "client.crt", KeyFile: "client.key", SkipVerify: true},
+			CookieFile: filepath.Join(t.TempDir(), "session.json"),
 		}), r)
 		cfg = GrafanaConfigFromContext(ctx)
 		transport, err := BuildTransport(&cfg, nil)
@@ -107,6 +109,7 @@ func TestGrafanaURLOverrideIsolatesConfiguredCredentials(t *testing.T) {
 	assert.Empty(t, cfg.TLSConfig.KeyFile)
 	assert.False(t, cfg.TLSConfig.SkipVerify)
 	assert.Empty(t, cfg.ExtraHeaders)
+	assert.Empty(t, cfg.CookieFile)
 	assert.Equal(t, int64(0), cfg.OrgID)
 
 	// A bare header cannot bypass the middleware and remains on the configured URL.

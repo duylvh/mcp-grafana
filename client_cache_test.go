@@ -120,9 +120,10 @@ func TestClientCache_DifferentCredentials(t *testing.T) {
 		{url: "http://host2:3000", apiKey: "key1", orgID: 1, forwardedHeaders: "X-WEBAUTH-USER=admin"},    // different url
 		{url: "http://host1:3000", apiKey: "key1", orgID: 1, forwardedHeaders: "X-WEBAUTH-USER=admin"},    // same as first
 		{url: "http://host1:3000", apiKey: "key1", orgID: 1, forwardedHeaders: "X-WEBAUTH-USER=john.doe"}, // different user
+		{url: "http://host1:3000", apiKey: "key1", orgID: 1, forwardedHeaders: "X-WEBAUTH-USER=admin", cookieFile: "/a/session.json"},
 	}
 
-	const numUniqueKeys = 5
+	const numUniqueKeys = 6
 
 	clients := make([]*GrafanaClient, len(keys))
 	for i, key := range keys {
@@ -138,9 +139,10 @@ func TestClientCache_DifferentCredentials(t *testing.T) {
 	assert.NotSame(t, clients[0], clients[2])
 	assert.NotSame(t, clients[0], clients[3])
 	assert.NotSame(t, clients[0], clients[5])
+	assert.NotSame(t, clients[0], clients[6])
 
 	g, _, _ := cache.Size()
-	assert.Equal(t, numUniqueKeys, g) // 5 unique keys
+	assert.Equal(t, numUniqueKeys, g)
 }
 
 func TestCacheKeyFromRequest(t *testing.T) {

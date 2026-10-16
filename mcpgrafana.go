@@ -47,6 +47,7 @@ const (
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
+	grafanaCookieFileEnvVar     = "GRAFANA_COOKIE_FILE"
 	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
 	grafanaForwardHeadersEnvVar = "GRAFANA_FORWARD_HEADERS"
 
@@ -302,6 +303,13 @@ type GrafanaConfig struct {
 	// A Timeout of zero means no timeout.
 	// Default is 10 seconds.
 	Timeout time.Duration
+
+	// CookieFile is the absolute path of an origin-keyed session file (the
+	// Loglens broker format). When set, BuildTransport replaces the Cookie
+	// header of every request with the session stored for URL's origin, read
+	// fresh on each request, and refuses requests to any other origin. Requests
+	// fail rather than go out without the cookie. Parsed from GRAFANA_COOKIE_FILE.
+	CookieFile string
 
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
@@ -763,7 +771,22 @@ var sensitiveHeaders = map[string]bool{
 	"X-Grafana-Id":                    true,
 	"X-Grafana-Service-Account-Token": true,
 	"X-Grafana-Api-Key":               true,
-	"Cookie":                          true,
+}
+
+// redactedHeaders hold whole sessions, so debug logs show nothing of them.
+var redactedHeaders = []string{"Cookie", "Set-Cookie"}
+
+func redactSensitiveHeaders(h http.Header) {
+	for name := range sensitiveHeaders {
+		if v := h.Get(name); v != "" {
+			h.Set(name, redactHeaderValue(v))
+		}
+	}
+	for _, name := range redactedHeaders {
+		if len(h.Values(name)) > 0 {
+			h.Set(name, "[REDACTED]")
+		}
+	}
 }
 
 // redactHeaderValue masks the middle portion of a credential value,
@@ -787,11 +810,7 @@ type debugLoggingRoundTripper struct {
 func (rt *debugLoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	redacted := req.Clone(req.Context())
 	redacted.Body = nil
-	for name := range sensitiveHeaders {
-		if v := redacted.Header.Get(name); v != "" {
-			redacted.Header.Set(name, redactHeaderValue(v))
-		}
-	}
+	redactSensitiveHeaders(redacted.Header)
 	if dump, err := httputil.DumpRequestOut(redacted, false); err == nil {
 		rt.logger.Debug(string(dump))
 	}
@@ -801,7 +820,10 @@ func (rt *debugLoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response
 		return resp, err
 	}
 
-	if dump, dumpErr := httputil.DumpResponse(resp, false); dumpErr == nil {
+	redactedResp := *resp
+	redactedResp.Header = resp.Header.Clone()
+	redactSensitiveHeaders(redactedResp.Header)
+	if dump, dumpErr := httputil.DumpResponse(&redactedResp, false); dumpErr == nil {
 		rt.logger.Debug(string(dump))
 	}
 	return resp, nil
@@ -842,14 +864,16 @@ func WithoutUserAgent() TransportOption {
 // BuildTransport constructs an http.RoundTripper with the standard middleware
 // chain derived from cfg. The default chain (innermost to outermost) is:
 //
-//	base → TLS → redirectGuard → debugLogging → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
+//	base → TLS → redirectGuard → cookieFile → debugLogging → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
 //
 // Auth is innermost among the header-setting layers so that credentials take
-// precedence over any forwarded/extra headers with the same keys.
+// precedence over any forwarded/extra headers with the same keys. The
+// cookieFile layer is present only when cfg.CookieFile is set and auth is not
+// skipped; it overrides any Cookie header set by outer layers.
 //
 // When cfg.Debug is true a debug-logging layer is added just above the base
-// transport. It sees the fully-decorated request (all headers set by outer
-// layers) and redacts sensitive values (Authorization, X-Access-Token, etc.)
+// transport. It sees headers set by outer layers, but not file-backed cookies,
+// and redacts sensitive values (Authorization, X-Access-Token, etc.)
 // before writing request/response details to the logger.
 //
 // Individual layers can be disabled with WithoutAuth, WithoutOrgID, etc.
@@ -894,6 +918,14 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 	}
 	if !cfg.AllowCrossOriginRedirects {
 		transport = &redirectGuardTransport{next: transport}
+	}
+
+	if cfg.CookieFile != "" && !options.withoutAuth {
+		cookies, err := newSessionCookieTransport(transport, cfg.CookieFile, cfg.URL)
+		if err != nil {
+			return nil, err
+		}
+		transport = cookies
 	}
 
 	// Debug logging with redacted credentials (innermost among the
@@ -1005,6 +1037,9 @@ var ExtractGrafanaInfoFromEnv StdioContextFunc = func(ctx context.Context) conte
 	}
 
 	extraHeaders := extraHeadersFromEnv(logger)
+	if cookieFile := getEnv(grafanaCookieFileEnvVar); cookieFile != "" {
+		config.CookieFile = cookieFile
+	}
 
 	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID, "extra_headers_count", len(extraHeaders))
 	config.URL = u
@@ -1047,8 +1082,14 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 			config.TLSConfig = &tlsConfig
 		}
 		config.BaseTransport = nil
+		config.CookieFile = ""
 		config.ExtraHeaders = forwardedHeadersFromRequest(req)
 	} else {
+		if apiKeyFromHeaders(req) != "" || req.Header.Get("Authorization") != "" || req.Header.Get("Cookie") != "" {
+			config.CookieFile = ""
+		} else if cookieFile := getEnv(grafanaCookieFileEnvVar); cookieFile != "" {
+			config.CookieFile = cookieFile
+		}
 		config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
 	}
 
@@ -1565,6 +1606,8 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					// transport-level injection since the OpenAPI client
 					// doesn't support them natively.
 					oboConfig := GrafanaConfig{
+						URL:                       grafanaURL,
+						CookieFile:                config.CookieFile,
 						AccessToken:               config.AccessToken,
 						IDToken:                   config.IDToken,
 						OrgID:                     config.OrgID,
@@ -1579,9 +1622,9 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					}
 					wrapped, err := BuildTransport(&oboConfig, base)
 					if err != nil {
-						if config.SOCKS5ProxyURL != "" {
+						if config.SOCKS5ProxyURL != "" || config.CookieFile != "" {
 							// Fail closed: a default transport would bypass the
-							// configured proxy. Install a transport that rejects
+							// configured proxy or cookie file. Install a transport that rejects
 							// every request so the failure surfaces as a graceful
 							// tool error rather than aborting request handling
 							// with a panic (matching the OnCall/incident paths).
@@ -1600,7 +1643,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 			}
 		}
 	}
-	if (config.SOCKS5ProxyURL != "" || config.OverrideURL != "") && !transportInstalled {
+	if (config.SOCKS5ProxyURL != "" || config.OverrideURL != "" || config.CookieFile != "") && !transportInstalled {
 		// Fail closed: the reflection above could not reach the OpenAPI
 		// client's transport field at all, so there is nowhere to install a
 		// fail-closed transport and its default transport would bypass the
@@ -1619,6 +1662,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		AccessToken:               config.AccessToken,
 		IDToken:                   config.IDToken,
 		TLSConfig:                 config.TLSConfig,
+		CookieFile:                config.CookieFile,
 		ExtraHeaders:              config.ExtraHeaders,
 		OverrideURL:               config.OverrideURL,
 		AllowCrossOriginRedirects: config.AllowCrossOriginRedirects,

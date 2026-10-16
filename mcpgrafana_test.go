@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-openapi/runtime/client"
 	grafana_client "github.com/grafana/grafana-openapi-client-go/client"
@@ -1175,7 +1176,7 @@ func TestDebugLoggingRedactsSensitiveHeaders(t *testing.T) {
 	var capturedReq *http.Request
 	mock := &capturingMockRT{fn: func(req *http.Request) (*http.Response, error) {
 		capturedReq = req
-		return &http.Response{StatusCode: 200, Header: http.Header{}}, nil
+		return &http.Response{StatusCode: 200, Header: http.Header{"Set-Cookie": {"session=response_cookie_secret_5678; HttpOnly"}}}, nil
 	}}
 
 	var buf bytes.Buffer
@@ -1188,14 +1189,17 @@ func TestDebugLoggingRedactsSensitiveHeaders(t *testing.T) {
 		ExtraHeaders: map[string]string{
 			"X-Grafana-Service-Account-Token": "glsa_forwarded_secret_1234",
 			"X-Grafana-Api-Key":               "legacy_forwarded_secret_1234",
+			"Cookie":                          "session=request_cookie_secret_1234",
 		},
 	}
 	transport, err := BuildTransport(cfg, mock, WithoutOtel())
 	require.NoError(t, err)
 
 	req, _ := http.NewRequest("GET", "http://example.com/api/search", nil)
-	_, err = transport.RoundTrip(req)
+	resp, err := transport.RoundTrip(req)
 	require.NoError(t, err)
+	assert.Equal(t, "session=response_cookie_secret_5678; HttpOnly", resp.Header.Get("Set-Cookie"))
+	assert.Equal(t, "session=request_cookie_secret_1234", capturedReq.Header.Get("Cookie"))
 
 	// The actual request to the server must still carry the real token.
 	assert.Equal(t, "Bearer glsa_supersecrettoken1234", capturedReq.Header.Get("Authorization"))
@@ -1207,6 +1211,9 @@ func TestDebugLoggingRedactsSensitiveHeaders(t *testing.T) {
 	assert.NotContains(t, logOutput, "glsa_supersecrettoken1234")
 	assert.NotContains(t, logOutput, "glsa_forwarded_secret_1234")
 	assert.NotContains(t, logOutput, "legacy_forwarded_secret_1234")
+	assert.NotContains(t, logOutput, "request_cookie_secret")
+	assert.NotContains(t, logOutput, "response_cookie_secret")
+	assert.NotContains(t, logOutput, "sess")
 	// But it should contain the redacted version.
 	assert.Contains(t, logOutput, "Bear***1234")
 }
@@ -1279,6 +1286,34 @@ func TestExtractGrafanaInfoWithExtraHeaders(t *testing.T) {
 		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
 		config := GrafanaConfigFromContext(ctx)
 		assert.Equal(t, map[string]string{"X-Tenant-ID": "tenant-456"}, config.ExtraHeaders)
+	})
+}
+
+func TestCookieFileFromEnv(t *testing.T) {
+	t.Run("set from env by both extractors", func(t *testing.T) {
+		t.Setenv(grafanaCookieFileEnvVar, "/run/loglens/session.json")
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		assert.Equal(t, "/run/loglens/session.json", GrafanaConfigFromContext(ExtractGrafanaInfoFromEnv(context.Background())).CookieFile)
+		assert.Equal(t, "/run/loglens/session.json", GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req)).CookieFile)
+	})
+
+	for _, header := range []string{grafanaServiceAccountTokenHeader, grafanaAPIKeyHeader, "Authorization", "Cookie"} {
+		t.Run("request credentials suppress cookie file "+header, func(t *testing.T) {
+			t.Setenv(grafanaCookieFileEnvVar, "/run/loglens/session.json")
+			req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+			req.Header.Set(header, "synthetic-credential")
+			base := WithGrafanaConfig(t.Context(), GrafanaConfig{CookieFile: "/embedder/session.json"})
+			config := GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(base, req))
+			assert.Empty(t, config.CookieFile)
+		})
+	}
+
+	t.Run("absent env keeps embedder setting", func(t *testing.T) {
+		t.Setenv(grafanaCookieFileEnvVar, "")
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		base := WithGrafanaConfig(context.Background(), GrafanaConfig{CookieFile: "/embedder/session.json"})
+		assert.Equal(t, "/embedder/session.json", GrafanaConfigFromContext(ExtractGrafanaInfoFromEnv(base)).CookieFile)
+		assert.Equal(t, "/embedder/session.json", GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(base, req)).CookieFile)
 	})
 }
 
@@ -1606,6 +1641,39 @@ func TestNewGrafanaClientOrgIDTransport(t *testing.T) {
 		_, _ = c.Search.Search(nil, nil)
 
 		assert.Empty(t, capturedHeaders.Get(grafana_client.OrgIDHeader))
+	})
+}
+
+func TestNewGrafanaClientCookieFile(t *testing.T) {
+	t.Cleanup(clearFrontendSettingsCaches)
+	clearFrontendSettingsCaches()
+
+	var cookies []string
+	ts := newTestHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[]`))
+	})
+	path := filepath.Join(t.TempDir(), "session.json")
+	ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{CookieFile: path})
+
+	t.Run("missing file sends nothing and surfaces an error", func(t *testing.T) {
+		c := NewGrafanaClient(ctx, ts.URL, "", nil)
+		_, err := c.Search.Search(nil, nil)
+		require.Error(t, err)
+		assert.Empty(t, cookies)
+	})
+
+	t.Run("session is sent on API requests", func(t *testing.T) {
+		clearFrontendSettingsCaches()
+		writeSessionJSON(t, path, sessionJSON(originOf(t, ts.URL), "sid=openapi", time.Now().Add(time.Hour)), 0o600)
+		c := NewGrafanaClient(ctx, ts.URL, "", nil)
+		_, err := c.Search.Search(nil, nil)
+		require.NoError(t, err)
+		require.NotEmpty(t, cookies)
+		for _, cookie := range cookies {
+			assert.Equal(t, "sid=openapi", cookie)
+		}
 	})
 }
 

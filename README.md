@@ -731,6 +731,56 @@ This only works for credentials that belong to more than one organization (e.g. 
 }
 ```
 
+### Browser session cookie file
+
+For a Grafana that only accepts a browser login (for example SSO without service accounts), set `GRAFANA_COOKIE_FILE` to the absolute path of an origin-keyed session file. A separate process, such as the Loglens browser extension and broker, writes the file; this server only reads it. Every request to Grafana carries the `Cookie` header from the file, read fresh each time, so a rotated session is used without restarting the server. It replaces any `Cookie` set through `GRAFANA_EXTRA_HEADERS` or forwarded headers. When unset, behavior is unchanged.
+
+The file maps the exact origin of `GRAFANA_URL` (scheme, host and non-default port, with no path) to a session. The values below are synthetic:
+
+```json
+{
+  "sessions": {
+    "https://grafana.example.com": {
+      "value": "grafana_session=EXAMPLE; grafana_session_expiry=EXAMPLE",
+      "expires": 1893456000,
+      "updatedAt": 1893452400,
+      "capturedAt": 1893452400
+    }
+  }
+}
+```
+
+`expires`, `updatedAt` and `capturedAt` (optional) are Unix seconds. Unknown fields and the legacy single-session format are rejected. Loglens writes this file to `~/.loglens/session.json`; the variable needs the expanded absolute path because the server does not expand `~`.
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "/path/to/mcp-grafana",
+      "args": ["--enabled-tools", "search,datasource,dashboard,prometheus", "--disable-write"],
+      "env": {
+        "GRAFANA_URL": "https://grafana.example.com",
+        "GRAFANA_COOKIE_FILE": "/Users/you/.loglens/session.json",
+        "GRAFANA_ORG_ID": "1"
+      }
+    }
+  }
+}
+```
+
+Behavior to expect:
+
+- Requests fail before any network call, with an error that never includes cookie contents, when the file is missing or malformed, has no entry for the `GRAFANA_URL` origin, holds a session that expires within 60 seconds, or holds an invalid cookie header.
+- The file must not be readable by group or others (`chmod 600`) on Unix. The writer should replace it atomically (write a temporary file, then rename).
+- A request to any origin other than `GRAFANA_URL`, including a cross-origin redirect even with `GRAFANA_ALLOW_CROSS_ORIGIN_REDIRECTS`, fails instead of sending the cookie. Same-origin redirects keep working.
+- The server does not refresh the session or run OAuth. Sign in again in the browser and let the writer update the file. An expired session produces an error saying so until then.
+- Debug logging (`--debug`) fully redacts `Cookie` and `Set-Cookie` values.
+- The incident client and the OnCall API client authenticate on their own and do not get the cookie. Selecting a Grafana URL per request (`X-Grafana-URL`) never uses the file.
+- On HTTP transports, incoming credentials in `X-Grafana-Service-Account-Token`, `X-Grafana-API-Key`, `Authorization`, or `Cookie` disable the cookie-file fallback. An HTTP server using the file otherwise shares that session with its callers; protect access to that server.
+- For cookie-only authentication, unset service-account token, token-file, username, and password settings. Otherwise both authentication methods can be sent.
+
+Before enabling writes, verify dashboard read access and a PromQL query with your session. Then remove `--disable-write` and test a dashboard change in an approved scratch folder.
+
 ### Custom HTTP Headers
 
 You can add arbitrary HTTP headers to all Grafana API requests using the `GRAFANA_EXTRA_HEADERS` environment variable. The value should be a JSON object mapping header names to values.

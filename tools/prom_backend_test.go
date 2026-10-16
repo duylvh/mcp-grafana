@@ -6,12 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/grafana/grafana-openapi-client-go/models"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/assert"
@@ -62,6 +66,41 @@ func TestPrometheusBackendQuery_NoWarnings(t *testing.T) {
 	_, warnings, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
 	require.NoError(t, err)
 	assert.Empty(t, warnings)
+}
+
+func TestQueryPrometheus_CookieFileFollowsRotation(t *testing.T) {
+	var queryCookies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/datasources/uid/prom-uid" {
+			_ = json.NewEncoder(w).Encode(&models.DataSource{UID: "prom-uid", Type: "prometheus"})
+			return
+		}
+		queryCookies = append(queryCookies, r.Header.Get("Cookie"))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	path := filepath.Join(t.TempDir(), "session.json")
+	writeSession := func(cookie string) {
+		t.Helper()
+		tmp := path + ".tmp"
+		content := fmt.Sprintf(`{"sessions":{%q:{"value":%q,"expires":%d,"updatedAt":1}}}`, server.URL, cookie, time.Now().Add(time.Hour).Unix())
+		require.NoError(t, os.WriteFile(tmp, []byte(content), 0o600))
+		require.NoError(t, os.Rename(tmp, path))
+	}
+
+	ctx := mockDatasourcesCtx(server)
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	cfg.CookieFile = path
+	ctx = mcpgrafana.WithGrafanaConfig(ctx, cfg)
+
+	for _, cookie := range []string{"sid=first", "sid=second"} {
+		writeSession(cookie)
+		_, err := queryPrometheus(ctx, QueryPrometheusParams{DatasourceUID: "prom-uid", Expr: "up", QueryType: "instant", EndTime: "now"})
+		require.NoError(t, err)
+	}
+	assert.Equal(t, []string{"sid=first", "sid=second"}, queryCookies)
 }
 
 func TestBackendForDatasource_RejectsTempoDatasource(t *testing.T) {
