@@ -74,7 +74,7 @@ func newSessionCookieTransport(next http.RoundTripper, path, grafanaURL string, 
 	}
 	t := &sessionCookieTransport{next: next, path: path, baseURL: baseURL, origin: origin}
 	if len(refreshCommand) > 0 {
-		t.refresher = cookieRefresherFor(path, refreshCommand)
+		t.refresher = cookieRefresherFor(path, origin, refreshCommand)
 	}
 	return t, nil
 }
@@ -184,9 +184,14 @@ func (t *sessionCookieTransport) cookieFor(target *url.URL) (string, error) {
 	return session.Value, nil
 }
 
+// readSession refuses a symlinked file, so the session cannot be redirected to
+// another location.
 func (t *sessionCookieTransport) readSession() (sessionCookie, error) {
-	f, err := os.Open(t.path)
+	f, err := os.OpenFile(t.path, os.O_RDONLY|openNoFollow, 0)
 	if err != nil {
+		if isSymlinkOpenError(err) {
+			return sessionCookie{}, fmt.Errorf("grafana cookie file: %s must not be a symlink", t.path)
+		}
 		err = fmt.Errorf("grafana cookie file: %w", err)
 		if errors.Is(err, fs.ErrNotExist) {
 			err = &staleSessionError{err}

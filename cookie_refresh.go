@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
@@ -71,7 +70,7 @@ func applyCookieEnv(config *GrafanaConfig) {
 }
 
 // cookieRefresher runs the refresh command for every transport that shares a
-// session file. One run is in flight at a time, requests that were already
+// session. One run is in flight at a time, requests that were already
 // waiting on a stale session share its result, and a failure pauses new runs.
 type cookieRefresher struct {
 	argv []string
@@ -86,9 +85,11 @@ type cookieRefresher struct {
 
 var cookieRefreshers sync.Map
 
-func cookieRefresherFor(path string, argv []string) *cookieRefresher {
-	key := path + "\x00" + strings.Join(argv, "\x00")
-	r, _ := cookieRefreshers.LoadOrStore(key, &cookieRefresher{argv: argv, now: time.Now})
+// cookieRefresherFor returns the one refresher of a session. A client builds
+// several transports (settings fetch, API calls) and the client cache builds
+// more per key, so without sharing each would run the command on its own.
+func cookieRefresherFor(path, origin string, argv []string) *cookieRefresher {
+	r, _ := cookieRefreshers.LoadOrStore(path+"\x00"+origin, &cookieRefresher{argv: argv, now: time.Now})
 	return r.(*cookieRefresher)
 }
 
