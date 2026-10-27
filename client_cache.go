@@ -34,6 +34,7 @@ type clientCacheKey struct {
 	password         string
 	orgID            int64
 	cookieFile       string
+	cookieRefresh    string // serialized refresh command
 	forwardedHeaders string // sorted, serialized forwarded headers for cache differentiation
 }
 
@@ -356,7 +357,7 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
 		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
-		key.cookieFile = config.CookieFile
+		key.cookieFile, key.cookieRefresh = config.CookieFile, strings.Join(config.CookieRefreshCommand, "\x00")
 
 		grafanaClient := cache.GetOrCreateGrafanaClient(key, func() *GrafanaClient {
 			logger.Debug("Creating new Grafana client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
@@ -375,7 +376,7 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 
 		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req, logger)
 		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, req)
-		key.cookieFile = config.CookieFile
+		key.cookieFile, key.cookieRefresh = config.CookieFile, strings.Join(config.CookieRefreshCommand, "\x00")
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
@@ -410,7 +411,7 @@ func extractKubernetesClientCached(cache *ClientCache) httpContextFunc {
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
 		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
-		key.cookieFile = config.CookieFile
+		key.cookieFile, key.cookieRefresh = config.CookieFile, strings.Join(config.CookieRefreshCommand, "\x00")
 
 		k8sClient := cache.GetOrCreateK8sClient(key, func() *KubernetesClient {
 			logger.Debug("Creating new Kubernetes client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))

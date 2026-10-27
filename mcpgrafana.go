@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -47,9 +48,10 @@ const (
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
-	grafanaCookieFileEnvVar     = "GRAFANA_COOKIE_FILE"
-	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
-	grafanaForwardHeadersEnvVar = "GRAFANA_FORWARD_HEADERS"
+	grafanaCookieFileEnvVar           = "GRAFANA_COOKIE_FILE"
+	grafanaCookieRefreshCommandEnvVar = "GRAFANA_COOKIE_REFRESH_COMMAND"
+	grafanaExtraHeadersEnvVar         = "GRAFANA_EXTRA_HEADERS"
+	grafanaForwardHeadersEnvVar       = "GRAFANA_FORWARD_HEADERS"
 
 	grafanaURLHeader                 = "X-Grafana-URL"
 	grafanaServiceAccountTokenHeader = "X-Grafana-Service-Account-Token"
@@ -310,6 +312,12 @@ type GrafanaConfig struct {
 	// fresh on each request, and refuses requests to any other origin. Requests
 	// fail rather than go out without the cookie. Parsed from GRAFANA_COOKIE_FILE.
 	CookieFile string
+
+	// CookieRefreshCommand is the program and arguments, run without a shell,
+	// that renews the session in CookieFile when it is missing, expired, or
+	// rejected by Grafana. Parsed from GRAFANA_COOKIE_REFRESH_COMMAND, a JSON
+	// array. Requires CookieFile.
+	CookieRefreshCommand []string
 
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
@@ -864,7 +872,7 @@ func WithoutUserAgent() TransportOption {
 // BuildTransport constructs an http.RoundTripper with the standard middleware
 // chain derived from cfg. The default chain (innermost to outermost) is:
 //
-//	base → TLS → redirectGuard → cookieFile → debugLogging → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
+//	base → TLS → redirectGuard → cookieFile (+refresh) → debugLogging → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
 //
 // Auth is innermost among the header-setting layers so that credentials take
 // precedence over any forwarded/extra headers with the same keys. The
@@ -920,8 +928,11 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 		transport = &redirectGuardTransport{next: transport}
 	}
 
+	if len(cfg.CookieRefreshCommand) > 0 && cfg.CookieFile == "" {
+		return nil, errors.New("grafana cookie refresh command requires a cookie file")
+	}
 	if cfg.CookieFile != "" && !options.withoutAuth {
-		cookies, err := newSessionCookieTransport(transport, cfg.CookieFile, cfg.URL)
+		cookies, err := newSessionCookieTransport(transport, cfg.CookieFile, cfg.URL, cfg.CookieRefreshCommand)
 		if err != nil {
 			return nil, err
 		}
@@ -1037,9 +1048,7 @@ var ExtractGrafanaInfoFromEnv StdioContextFunc = func(ctx context.Context) conte
 	}
 
 	extraHeaders := extraHeadersFromEnv(logger)
-	if cookieFile := getEnv(grafanaCookieFileEnvVar); cookieFile != "" {
-		config.CookieFile = cookieFile
-	}
+	applyCookieEnv(&config)
 
 	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID, "extra_headers_count", len(extraHeaders))
 	config.URL = u
@@ -1083,12 +1092,14 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 		}
 		config.BaseTransport = nil
 		config.CookieFile = ""
+		config.CookieRefreshCommand = nil
 		config.ExtraHeaders = forwardedHeadersFromRequest(req)
 	} else {
 		if apiKeyFromHeaders(req) != "" || req.Header.Get("Authorization") != "" || req.Header.Get("Cookie") != "" {
 			config.CookieFile = ""
-		} else if cookieFile := getEnv(grafanaCookieFileEnvVar); cookieFile != "" {
-			config.CookieFile = cookieFile
+			config.CookieRefreshCommand = nil
+		} else {
+			applyCookieEnv(&config)
 		}
 		config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
 	}
@@ -1608,6 +1619,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					oboConfig := GrafanaConfig{
 						URL:                       grafanaURL,
 						CookieFile:                config.CookieFile,
+						CookieRefreshCommand:      config.CookieRefreshCommand,
 						AccessToken:               config.AccessToken,
 						IDToken:                   config.IDToken,
 						OrgID:                     config.OrgID,
@@ -1663,6 +1675,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		IDToken:                   config.IDToken,
 		TLSConfig:                 config.TLSConfig,
 		CookieFile:                config.CookieFile,
+		CookieRefreshCommand:      config.CookieRefreshCommand,
 		ExtraHeaders:              config.ExtraHeaders,
 		OverrideURL:               config.OverrideURL,
 		AllowCrossOriginRedirects: config.AllowCrossOriginRedirects,

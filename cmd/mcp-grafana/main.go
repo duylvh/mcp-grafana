@@ -1382,6 +1382,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if err := mcpgrafana.ValidateCookieRefreshEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	if err := gc.validateLokiGuardrail(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)

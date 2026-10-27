@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,9 +46,18 @@ type sessionCookieTransport struct {
 	path    string
 	baseURL *url.URL
 	origin  string
+	// refresher is nil unless a refresh command is configured.
+	refresher *cookieRefresher
 }
 
-func newSessionCookieTransport(next http.RoundTripper, path, grafanaURL string) (*sessionCookieTransport, error) {
+// staleSessionError marks a missing or expired session, the cases a refresh
+// command can repair, apart from a malformed file or a refused origin.
+type staleSessionError struct{ err error }
+
+func (e *staleSessionError) Error() string { return e.err.Error() }
+func (e *staleSessionError) Unwrap() error { return e.err }
+
+func newSessionCookieTransport(next http.RoundTripper, path, grafanaURL string, refreshCommand []string) (*sessionCookieTransport, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("grafana cookie file must be an absolute path")
 	}
@@ -62,7 +72,11 @@ func newSessionCookieTransport(next http.RoundTripper, path, grafanaURL string) 
 	if !ok {
 		return nil, errors.New("grafana cookie file requires an http(s) Grafana URL")
 	}
-	return &sessionCookieTransport{next: next, path: path, baseURL: baseURL, origin: origin}, nil
+	t := &sessionCookieTransport{next: next, path: path, baseURL: baseURL, origin: origin}
+	if len(refreshCommand) > 0 {
+		t.refresher = cookieRefresherFor(path, refreshCommand)
+	}
+	return t, nil
 }
 
 // sessionOrigin formats u like the browser's URL.origin, which is how the
@@ -81,7 +95,33 @@ func sessionOrigin(u *url.URL) (string, bool) {
 	return scheme + "://" + host + ":" + port, true
 }
 
+// RoundTrip sends req with the session cookie. With a refresh command, a
+// missing or expired session, a 401, or a redirect away from Grafana (the
+// sign-in page of an SSO proxy) renews the session and retries once.
 func (t *sessionCookieTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.refresher == nil {
+		return t.send(req)
+	}
+	generation := t.refresher.Generation()
+	resp, err := t.send(req)
+	if !t.sessionRejected(req, resp, err) || !replayable(req) {
+		return resp, err
+	}
+	if resp != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		_ = resp.Body.Close()
+	}
+	if err := t.refresher.Refresh(req.Context(), generation); err != nil {
+		return nil, err
+	}
+	retry, err := rewound(req)
+	if err != nil {
+		return nil, err
+	}
+	return t.send(retry)
+}
+
+func (t *sessionCookieTransport) send(req *http.Request) (*http.Response, error) {
 	cookie, err := t.cookieFor(req.URL)
 	if err != nil {
 		if req.Body != nil {
@@ -94,6 +134,39 @@ func (t *sessionCookieTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return t.next.RoundTrip(cloned)
 }
 
+func (t *sessionCookieTransport) sessionRejected(req *http.Request, resp *http.Response, err error) bool {
+	if err != nil {
+		var stale *staleSessionError
+		return errors.As(err, &stale)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return true
+	}
+	if resp.StatusCode < 300 || resp.StatusCode > 399 {
+		return false
+	}
+	location, err := req.URL.Parse(resp.Header.Get("Location"))
+	return err == nil && !sameHTTPOrigin(location, t.baseURL)
+}
+
+func replayable(req *http.Request) bool {
+	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
+}
+
+// rewound returns req with a fresh body, since sending consumed the original.
+func rewound(req *http.Request) (*http.Request, error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return req, nil
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	retry := req.Clone(req.Context())
+	retry.Body = body
+	return retry, nil
+}
+
 func (t *sessionCookieTransport) cookieFor(target *url.URL) (string, error) {
 	if !sameHTTPOrigin(target, t.baseURL) {
 		return "", fmt.Errorf("grafana cookie file: refusing to send session for %s to %s", t.origin, redirectOriginForError(target))
@@ -103,7 +176,7 @@ func (t *sessionCookieTransport) cookieFor(target *url.URL) (string, error) {
 		return "", err
 	}
 	if session.Expires <= time.Now().Add(sessionExpiryGrace).Unix() {
-		return "", fmt.Errorf("grafana cookie file: session for %s is expired or expires within %s; sign in again in the browser and let the extension sync", t.origin, sessionExpiryGrace)
+		return "", &staleSessionError{fmt.Errorf("grafana cookie file: session for %s is expired or expires within %s; sign in to Grafana in the browser again", t.origin, sessionExpiryGrace)}
 	}
 	if _, err := http.ParseCookie(session.Value); err != nil {
 		return "", fmt.Errorf("grafana cookie file: session for %s is not a valid Cookie header value", t.origin)
@@ -114,7 +187,11 @@ func (t *sessionCookieTransport) cookieFor(target *url.URL) (string, error) {
 func (t *sessionCookieTransport) readSession() (sessionCookie, error) {
 	f, err := os.Open(t.path)
 	if err != nil {
-		return sessionCookie{}, fmt.Errorf("grafana cookie file: %w", err)
+		err = fmt.Errorf("grafana cookie file: %w", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			err = &staleSessionError{err}
+		}
+		return sessionCookie{}, err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -136,7 +213,7 @@ func (t *sessionCookieTransport) readSession() (sessionCookie, error) {
 	}
 	session, ok := file.Sessions[t.origin]
 	if !ok {
-		return sessionCookie{}, fmt.Errorf("grafana cookie file: %s has no session for %s", t.path, t.origin)
+		return sessionCookie{}, &staleSessionError{fmt.Errorf("grafana cookie file: %s has no session for %s", t.path, t.origin)}
 	}
 	return session, nil
 }
