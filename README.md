@@ -773,11 +773,19 @@ Behavior to expect:
 - Requests fail before any network call, with an error that never includes cookie contents, when the file is missing or malformed, has no entry for the `GRAFANA_URL` origin, holds a session that expires within 60 seconds, or holds an invalid cookie header.
 - The file must not be readable by group or others (`chmod 600`) on Unix. The writer should replace it atomically (write a temporary file, then rename).
 - A request to any origin other than `GRAFANA_URL`, including a cross-origin redirect even with `GRAFANA_ALLOW_CROSS_ORIGIN_REDIRECTS`, fails instead of sending the cookie. Same-origin redirects keep working.
-- The server does not refresh the session or run OAuth. Sign in again in the browser and let the writer update the file. An expired session produces an error saying so until then.
+- The server does not run OAuth itself. Without `GRAFANA_COOKIE_REFRESH_COMMAND`, sign in again in the browser and let the writer update the file; an expired session produces an error saying so until then.
+- The file must not be a symlink; it is opened without following links.
 - Debug logging (`--debug`) fully redacts `Cookie` and `Set-Cookie` values.
 - The incident client and the OnCall API client authenticate on their own and do not get the cookie. Selecting a Grafana URL per request (`X-Grafana-URL`) never uses the file.
 - On HTTP transports, incoming credentials in `X-Grafana-Service-Account-Token`, `X-Grafana-API-Key`, `Authorization`, or `Cookie` disable the cookie-file fallback. An HTTP server using the file otherwise shares that session with its callers; protect access to that server.
 - For cookie-only authentication, unset service-account token, token-file, username, and password settings. Otherwise both authentication methods can be sent.
+
+To renew the session on demand, set `GRAFANA_COOKIE_REFRESH_COMMAND` to a JSON array holding a program and its arguments, for example `["node", "/abs/path/cli.mjs", "refresh", "https://grafana.example.com"]`. It runs without a shell and must exit 0 after writing the session file. It is valid only together with `GRAFANA_COOKIE_FILE`; invalid JSON, an empty array, or a missing cookie file stops the server at startup.
+
+- The command runs when the stored session is missing or expired, when Grafana answers `401`, or when it redirects to another origin (an SSO sign-in page). The request is then retried once, only if its body can be replayed.
+- One run happens at a time per session file. Concurrent requests share its result. The command has 90 seconds to finish and its output is discarded.
+- After a failed run the command is not started again for 60 seconds, and requests fail with `grafana cookie refresh failed; sign in to Grafana in Chrome once, then retry`.
+- Incoming credentials that disable the cookie-file fallback disable the refresh command too.
 
 Before enabling writes, verify dashboard read access and a PromQL query with your session. Then remove `--disable-write` and test a dashboard change in an approved scratch folder.
 
