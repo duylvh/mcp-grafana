@@ -100,10 +100,11 @@ func sessionOrigin(u *url.URL) (string, bool) {
 // sign-in page of an SSO proxy) renews the session and retries once.
 func (t *sessionCookieTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.refresher == nil {
-		return t.send(req)
+		resp, _, err := t.send(req)
+		return resp, err
 	}
 	generation := t.refresher.Generation()
-	resp, err := t.send(req)
+	resp, sent, err := t.send(req)
 	if !t.sessionRejected(req, resp, err) || !replayable(req) {
 		return resp, err
 	}
@@ -111,27 +112,34 @@ func (t *sessionCookieTransport) RoundTrip(req *http.Request) (*http.Response, e
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
 	}
-	if err := t.refresher.Refresh(req.Context(), generation); err != nil {
-		return nil, err
+	// Another process may have signed in since this request read the file;
+	// its session is used before paying for a new sign-in.
+	if stored, err := t.cookieFor(req.URL); err != nil || stored == sent {
+		if err := t.refresher.Refresh(req.Context(), generation); err != nil {
+			return nil, err
+		}
 	}
 	retry, err := rewound(req)
 	if err != nil {
 		return nil, err
 	}
-	return t.send(retry)
+	resp, _, err = t.send(retry)
+	return resp, err
 }
 
-func (t *sessionCookieTransport) send(req *http.Request) (*http.Response, error) {
+// send returns the cookie it sent, empty when the request was not sent.
+func (t *sessionCookieTransport) send(req *http.Request) (*http.Response, string, error) {
 	cookie, err := t.cookieFor(req.URL)
 	if err != nil {
 		if req.Body != nil {
 			_ = req.Body.Close()
 		}
-		return nil, err
+		return nil, "", err
 	}
 	cloned := req.Clone(req.Context())
 	cloned.Header.Set("Cookie", cookie)
-	return t.next.RoundTrip(cloned)
+	resp, err := t.next.RoundTrip(cloned)
+	return resp, cookie, err
 }
 
 func (t *sessionCookieTransport) sessionRejected(req *http.Request, resp *http.Response, err error) bool {

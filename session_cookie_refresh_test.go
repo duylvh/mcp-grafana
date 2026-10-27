@@ -135,6 +135,25 @@ func TestCookieRefreshAfterRejectedSession(t *testing.T) {
 	assert.Equal(t, 1, fake.runs(t))
 }
 
+func TestCookieRefreshUsesSessionSavedByAnotherProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	var origin string
+	g := newGrafanaFake(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeSessionJSON(t, path, sessionJSON(origin, "sid=new", time.Now().Add(time.Hour)), 0o600)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	origin = originOf(t, g.URL)
+	writeSessionJSON(t, path, sessionJSON(origin, "sid=old", time.Now().Add(time.Hour)), 0o600)
+	fake := newFakeRefresh(t, path, origin, "sid=new", false, "0")
+
+	resp, err := refreshClient(t, g.URL, path, fake.argv).Get(g.URL + "/api/search")
+	assert.Equal(t, http.StatusOK, status(t, resp, err))
+
+	cookies, _ := g.seen()
+	assert.Equal(t, []string{"sid=old", "sid=new"}, cookies)
+	assert.Equal(t, 0, fake.runs(t), "a session already renewed in the file needs no sign-in")
+}
+
 func TestCookieRefreshAfterRedirectToForeignOrigin(t *testing.T) {
 	var foreignRequests atomic.Int32
 	foreign := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { foreignRequests.Add(1) }))
